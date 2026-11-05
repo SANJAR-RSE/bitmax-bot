@@ -490,13 +490,16 @@ buyerHandler.action(/^rate_(.+)_([1-5])$/, async (ctx) => {
       await ctx.answerCbQuery(owned.error);
       return;
     }
-    if (owned.escrow.buyerRating) {
-      await ctx.answerCbQuery('Siz allaqachon baho bergansiz');
+    // Conditional update: two quick taps cannot count twice, and an open order cannot be rated.
+    const claimed = await EscrowHold.findOneAndUpdate(
+      { _id: escrowId, buyerRating: { $exists: false }, status: { $in: ['released', 'refunded', 'partial_refunded'] } },
+      { $set: { buyerRating: rating } }
+    );
+    if (!claimed) {
+      await ctx.answerCbQuery('Baho faqat yakunlangan bitimga bir marta beriladi');
       return;
     }
 
-    owned.escrow.buyerRating = rating;
-    await owned.escrow.save();
     await User.findByIdAndUpdate(owned.escrow.sellerId, {
       $inc: { 'sellerStats.ratingSum': rating, 'sellerStats.ratingCount': 1 },
     });
@@ -615,7 +618,7 @@ buyerHandler.action(/^rdo_(not_working|wrong_info|recovered|other)_(.+)$/, async
         `<b>Jarima:</b> ${formatUzs(result.penaltyAmount ?? 0)}`,
         `<b>Balansingizga qaytarildi:</b> <b>${formatUzs(result.refundToBuyer ?? 0)}</b>`,
         '',
-        `<i>Pulni kartangizga yechish uchun “💰 Balans” → “Pul yechish”.</i>`,
+        `<i>Pulni kartangizga yechish uchun “Balans” → “Pul yechish”.</i>`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );

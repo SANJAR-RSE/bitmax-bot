@@ -494,6 +494,11 @@ export class PaymentService {
     const hold = await EscrowHold.findById(escrowHoldId);
     if (!hold) throw new Error('Escrow hold not found');
     if (buyerUserId && String(hold.buyerId) !== String(buyerUserId)) throw new ForbiddenError();
+    // The UI hides this, but the rule has to hold for a crafted request too: nobody can accept
+    // goods they have not opened.
+    if (buyerUserId && !hold.credentialsRevealedAt) {
+      throw new ForbiddenError('Avval akkaunt ma’lumotlarini oching va tekshiring');
+    }
 
     await this.releaseToSeller(escrowHoldId, buyerUserId);
     return { released: true, sellerPayout: hold.sellerPayout, commission: hold.commission };

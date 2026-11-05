@@ -8,7 +8,7 @@ import { User } from '../models/User';
 import { botApi } from '../services/botApi';
 import { CATEGORIES } from '../categories';
 import { notificationService } from '../services/notificationService';
-import { config } from '../config';
+import { config, isAdminTelegramId } from '../config';
 import { escapeHtml, formatUzs, formatDealCode, isValidUzCard, maskCard } from '../utils/helpers';
 import { uploadTelegramPhoto, ImageUploadError } from '../services/cloudinaryService';
 import { bailIfCancelled } from '../wizards/guard';
@@ -133,6 +133,7 @@ sellerHandler.hears(["🤝 Kafil bitim (escrow)","Kafil bitim (escrow)","🤝 Ka
 
 sellerHandler.action('deal_side_seller', async (ctx) => {
   await ctx.answerCbQuery();
+  await User.updateOne({ telegramId: ctx.from!.id, role: 'buyer' }, { $set: { role: 'seller' } });
   await (ctx as any).scene?.enter(DEAL_WIZARD);
 });
 
@@ -219,9 +220,11 @@ sellerHandler.action(/^listing_cancel_do_([a-f0-9]{24})$/, async ctx => {
   await showMyListings(ctx, 1, true);
 });
 
-sellerHandler.hears(["📊 Statistika","Statistika"], async (ctx) => {
+sellerHandler.hears(["📊 Statistika","Statistika"], async (ctx, next) => {
   const user = await User.findOne({ telegramId: ctx.from!.id });
-  if (!user || user.role === 'admin') return; // admin has its own stats screen
+  if (!user) return;
+  // Staff have their own screen further down the chain, so hand the update on.
+  if (isAdminTelegramId(ctx.from!.id) || user.role === 'moderator') return next();
 
   const products = await botApi.getUserProducts(user._id.toString());
   const activeCount = products.filter((p) => p.status === 'active').length;
@@ -257,8 +260,8 @@ async function renderDealReview(ctx: any) {
       '',
       `<b>Nomi:</b> ${escapeHtml(data.title)}`,
       `<b>Narx:</b> ${formatUzs(data.price)}`,
-      `<b>Login:</b> ${escapeHtml(data.login)}`,
-      `<b>Parol:</b> ${'•'.repeat(Math.min(12, data.password.length))}`,
+      `<b>Login:</b> ${escapeHtml(decryptSecret(data.login))}`,
+      `<b>Parol:</b> ••••••••`,
       `<b>Rasmlar:</b> ${images.length > 0 ? `${images.length} ta` : 'yo‘q'}`,
       '',
       `<b>Siz olasiz:</b> ${formatUzs(data.price - commission)}`,
@@ -332,7 +335,7 @@ export function createDealWizard() {
       const rawPrice = String(ctx.message?.text || '').trim();
       const price = /^\d[\d\s]*$/.test(rawPrice) ? Number(rawPrice.replace(/\s/g, '')) : NaN;
       if (!Number.isSafeInteger(price) || price < 1000 || price > 1_000_000_000) {
-        await ctx.reply(
+        await ctx.replyWithHTML(
           `Minimal summa 1 000 UZS. “${escapeHtml(ctx.session.dealData.title)}” uchun narxni qaytadan kiriting:`
         );
         return;
@@ -363,7 +366,9 @@ export function createDealWizard() {
         await ctx.reply('Iltimos, loginni kiriting:');
         return;
       }
-      ctx.session.dealData.login = text;
+      // Sessions live in Mongo, so drafts are sealed like the listing itself and the chat copy goes.
+      ctx.session.dealData.login = encryptSecret(text);
+      await ctx.deleteMessage().catch(() => undefined);
       await ctx.reply('🔐 4/4 — Parolni kiriting:');
       return ctx.wizard.next();
     },
@@ -377,7 +382,8 @@ export function createDealWizard() {
         await ctx.reply('Iltimos, parolni kiriting:');
         return;
       }
-      ctx.session.dealData.password = text;
+      ctx.session.dealData.password = encryptSecret(text);
+      await ctx.deleteMessage().catch(() => undefined);
       ctx.session.dealData.images = [];
 
       await ctx.replyWithHTML(photoStepPrompt(0), photoStepButtons(0));
@@ -391,8 +397,12 @@ export function createDealWizard() {
     async (ctx: any) => {
       const action = ctx.callbackQuery?.data;
 
-      if (action !== 'deal_publish_confirm') {
-        await ctx.answerCbQuery?.('Bekor qilindi');
+      if (await bailIfCancelled(ctx, ['dealData'])) return;
+      if (!['deal_publish_confirm', 'deal_publish_cancel'].includes(action)) {
+        return ctx.reply('Quyidagi tasdiqlash yoki bekor qilish tugmasini bosing.');
+      }
+      if (action === 'deal_publish_cancel') {
+        await ctx.answerCbQuery('Bekor qilindi');
         ctx.session.dealData = {};
         await ctx.reply('Bitim yaratish bekor qilindi.', sellerMenuKeyboard);
         return ctx.scene.leave();
@@ -402,15 +412,26 @@ export function createDealWizard() {
       if (!user) return ctx.scene.leave();
 
       const data = ctx.session.dealData;
-      const deal = await botApi.createDeal({ sellerId: String(user._id), ...data });
+      await ctx.answerCbQuery('Yaratilmoqda…');
+      let deal;
+      try {
+        deal = await botApi.createDeal({
+          sellerId: String(user._id),
+          ...data,
+          login: decryptSecret(data.login),
+          password: decryptSecret(data.password),
+        });
+      } catch (error) {
+        await ctx.reply(describeError(error) + ' Ma’lumotlar saqlanib turibdi. Tasdiqlashni qayta bosing yoki /cancel yozing.');
+        return;
+      }
 
-      // Wipe the plaintext password out of the session the moment it is persisted.
+      // Clear the sealed draft as soon as the deal is stored.
       ctx.session.dealData = {};
 
       const commission = Math.round((deal.price * config.platformCommission) / 100);
       const code = formatDealCode(deal.dealCode!);
 
-      await ctx.answerCbQuery('Yaratildi');
       await ctx.editMessageText(
         [
           `✅ <b>Bitim tayyor!</b>`,
@@ -422,7 +443,7 @@ export function createDealWizard() {
           `<b>🔑 Xaridorga shu kodni yuboring:</b>`,
           `<code>${code}</code>`,
           '',
-          `<i>Xaridor botga kirib “🔑 Kod bilan sotib olish” ni bosadi va shu kodni kiritadi.</i>`,
+          `<i>Xaridor botda “Kafil bitim” → “Men sotib olyapman” ni tanlab, shu kodni kiritadi.</i>`,
           '',
           `⏳ Kod 7 kun amal qiladi — muddati o‘tsa, sizga xabar beramiz.`,
         ].join('\n'),
@@ -433,8 +454,8 @@ export function createDealWizard() {
               [
                 {
                   text: '📤 Xaridorga yuborish',
-                  // Prefilled forward: the seller picks the chat and Telegram sends the text.
-                  switch_inline_query: `\n\n🤝 Bitmax kafil bitimi\n${deal.title}\nSumma: ${formatUzs(deal.price)}\nKod: ${code}\n\nhttps://t.me/${config.botUsername}`,
+                  // A share link, not switch_inline_query: inline mode is off for this bot.
+                  url: `https://t.me/share/url?url=${encodeURIComponent(`https://t.me/${config.botUsername}`)}&text=${encodeURIComponent(`🤝 Bitmax kafil bitimi\n${deal.title}\nSumma: ${formatUzs(deal.price)}\nKod: ${code}`)}`,
                 },
               ],
               [{ text: '❌ Bitimni bekor qilish', callback_data: `deal_cancel_${deal._id}` }],
@@ -464,8 +485,8 @@ async function renderProductReview(ctx: any) {
       `<b>Narx:</b> ${formatUzs(data.price)}`,
       `<b>Kategoriya:</b> ${escapeHtml(data.category)}`,
       '',
-      `<b>Login:</b> ${escapeHtml(data.login)}`,
-      `<b>Parol:</b> ${'•'.repeat(Math.min(12, data.password.length))}`,
+      `<b>Login:</b> ${escapeHtml(decryptSecret(data.login))}`,
+      `<b>Parol:</b> ••••••••`,
       `<b>Tiklash kodi:</b> ${data.recoveryCode ? 'kiritilgan' : 'yo‘q'}`,
       `<b>Rasmlar:</b> ${images.length > 0 ? `${images.length} ta` : 'yo‘q'}`,
       '',
@@ -530,7 +551,7 @@ export function createSellerWizard() {
 
       const text = ctx.message?.text?.trim();
       if (!text || text.length < 20) {
-        await ctx.reply(
+        await ctx.replyWithHTML(
           `Tavsif kamida 20 belgi bo‘lishi kerak. “${escapeHtml(ctx.session.productData.title)}” haqida batafsil yozing:`
         );
         return;
@@ -599,7 +620,8 @@ export function createSellerWizard() {
         await ctx.reply('Iltimos, loginni kiriting:');
         return;
       }
-      ctx.session.productData.login = text;
+      ctx.session.productData.login = encryptSecret(text);
+      await ctx.deleteMessage().catch(() => undefined);
       await ctx.reply('6. Parolni kiriting:');
       return ctx.wizard.next();
     },
@@ -612,7 +634,8 @@ export function createSellerWizard() {
         await ctx.reply('Iltimos, parolni kiriting:');
         return;
       }
-      ctx.session.productData.password = text;
+      ctx.session.productData.password = encryptSecret(text);
+      await ctx.deleteMessage().catch(() => undefined);
       await ctx.reply('7. Tiklash kodi / qo‘shimcha ma’lumot (bo‘lmasa "yo‘q" deb yozing):');
       return ctx.wizard.next();
     },
@@ -622,8 +645,9 @@ export function createSellerWizard() {
       if (await bailIfCancelled(ctx, ['productData'])) return;
 
       const text = ctx.message?.text?.trim();
-      ctx.session.productData.recoveryCode =
-        !text || /^(yo['’]?q|yoq|no|-)$/i.test(text) ? undefined : text;
+      const hasRecoveryCode = Boolean(text) && !/^(yo['’]?q|yoq|no|-)$/i.test(text);
+      ctx.session.productData.recoveryCode = hasRecoveryCode ? encryptSecret(text) : undefined;
+      if (hasRecoveryCode) await ctx.deleteMessage().catch(() => undefined);
       ctx.session.productData.images = [];
 
       await ctx.replyWithHTML(photoStepPrompt(0), photoStepButtons(0));
@@ -632,6 +656,16 @@ export function createSellerWizard() {
 
     // Photo collection (optional, up to config.maxProductImages)
     makePhotoStep('productData', async ctx => {
+      // A saved card is reused as it is; it changes only from the Balance screen.
+      const seller = await User.findOne({ telegramId: ctx.from.id });
+      if (seller?.payoutCard?.encrypted) {
+        ctx.session.productData.cardMasked = seller.payoutCard.masked;
+        ctx.session.productData.cardHolder = seller.payoutCard.holder;
+        // Lands on the holder step; the review renderer then advances onto the confirm step.
+        ctx.wizard.selectStep(ctx.wizard.cursor + 2);
+        await renderProductReview(ctx);
+        return;
+      }
       await ctx.replyWithHTML('<b>To‘lov kartangiz</b>\n\nSavdodan tushgan pulni yechish uchun 16 xonali karta raqamingizni kiriting. Karta xaridorlarga ko‘rsatilmaydi.');
       return ctx.wizard.next();
     }),
@@ -674,18 +708,23 @@ export function createSellerWizard() {
 
       const data = ctx.session.productData;
       await ctx.answerCbQuery('E’lon saqlanmoqda…');
-      if (!data.cardEncrypted || !data.cardHolder) return ctx.reply('Karta ma’lumotlari topilmadi. /cancel orqali chiqib, e’lonni qayta yarating.');
+      if (!data.cardMasked || !data.cardHolder) return ctx.reply('Karta ma’lumotlari topilmadi. /cancel orqali chiqib, e’lonni qayta yarating.');
       let product;
       try {
-        await payoutService.setPayoutCard(String(user._id), decryptSecret(data.cardEncrypted), data.cardHolder);
-        product = await botApi.createProduct({ sellerId: user._id.toString(), ...data });
+        if (data.cardEncrypted) await payoutService.setPayoutCard(String(user._id), decryptSecret(data.cardEncrypted), data.cardHolder);
+        product = await botApi.createProduct({
+          sellerId: user._id.toString(),
+          ...data,
+          login: decryptSecret(data.login),
+          password: decryptSecret(data.password),
+          recoveryCode: data.recoveryCode ? decryptSecret(data.recoveryCode) : undefined,
+        });
       } catch (error) {
         await ctx.reply(describeError(error) + ' Ma’lumotlar saqlanib turibdi. Tasdiqlashni qayta bosing yoki /cancel yozing.');
         return;
       }
 
-      // Clear the plaintext credentials out of the session as soon as they're persisted —
-      // no reason to leave a live password sitting in a session document.
+      // Clear the sealed draft as soon as the listing is stored.
       ctx.session.productData = {};
       await ctx.scene.leave();
 

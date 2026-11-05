@@ -1,0 +1,60 @@
+# Render Blueprint for the standalone Bitmax Telegram bot repository.
+# On boot the bot points the Telegram webhook at this service's own RENDER_EXTERNAL_URL.
+
+services:
+  - type: web
+    name: bitimax-telegram-bot
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JOBS_ENABLED
+        value: false
+      - key: BOT_USERNAME
+        value: bitimax_bot
+
+      # Copy these from the backend service. MONGODB_URI and ENCRYPTION_KEY must match exactly:
+      # both services read the same stored credentials.
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: SUPPORT_USERNAME
+        sync: false
+      - key: SITE_URL
+        sync: false
+
+      # Payments: must match the backend service.
+      - key: PAYMENT_PROVIDER
+        sync: false
+      - key: TEZCHECK_API_KEY
+        sync: false
+      - key: TEZCHECK_CASH_DESK_CODE
+        sync: false
+      - key: TEZCHECK_WEBHOOK_SECRET
+        sync: false
+      - key: PAYMENT_CARDS
+        sync: false
+
+      # Seller photo uploads from the bot.
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false

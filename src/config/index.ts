@@ -96,7 +96,6 @@ export const config = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
-  webhookSecret: required('WEBHOOK_SECRET', 'dev_only_webhook_secret_change_me'),
   // Shared secret required on every internal (non-public) backend route, e.g. escrow/transactions
   // management. Only the bot process and trusted internal tools should ever hold this value.
   internalApiKey: required('INTERNAL_API_KEY', 'dev_only_internal_key_change_me'),
@@ -107,10 +106,6 @@ export const config = {
     '0'.repeat(64) // dev-only: predictable, never use outside local development
   ),
 
-  // Signs the web session token (see utils/jwt.ts). Separate from every other secret on
-  // purpose: leaking it forges logins but decrypts nothing, and rotating it just logs
-  // everybody out instead of destroying stored credentials.
-  sessionSecret: required('SESSION_SECRET', 'dev_only_session_secret_change_me'),
   // How long a browser session stays valid before the user has to re-approve in the bot.
   webSessionDays: num('WEB_SESSION_DAYS', 7),
   // How long an unapproved web login request stays claimable.

@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import express, { RequestHandler } from 'express';
 import helmet from 'helmet';
 import { Telegraf, Scenes, session } from 'telegraf';
-import { config } from './config';
+import { config, isAdminTelegramId } from './config';
 import { connectDatabase } from './db/mongoose';
 import { mongoSessionStore } from './models/BotSession';
 import { User } from './models/User';
@@ -14,6 +14,7 @@ import { buyerHandler, createCodeWizard } from './handlers/buyer';
 import { adminHandler, createRoleWizard } from './handlers/admin';
 import { botApi } from './services/botApi';
 import { listingLookup } from './handlers/catalog';
+import { wizardEscape } from './wizards/escape';
 import { escapeHtml, formatUzs } from './utils/helpers';
 
 /**
@@ -77,6 +78,11 @@ export async function startBot(): Promise<void> {
         else await ctx.reply(notice);
         return;
       }
+      // Done here, before any handler runs, so the first /start already shows the admin menu.
+      if (isAdminTelegramId(ctx.from.id) && user.role !== 'admin') {
+        await User.updateOne({ _id: user._id }, { $set: { role: 'admin' } });
+        user.role = 'admin';
+      }
       (ctx.state as any).user = user;
     } catch (err) {
       console.error('[Bot] Failed to resolve user:', err);
@@ -87,6 +93,7 @@ export async function startBot(): Promise<void> {
     return next();
   });
 
+  bot.use(wizardEscape);
   bot.use(listingLookup);
   bot.use(stage.middleware());
 
@@ -158,8 +165,18 @@ export async function startBot(): Promise<void> {
     });
   });
 
-  bot.catch((err: any, ctx: any) => {
+  // Anything no handler claimed gets an answer: silence reads as a dead bot.
+  bot.on('message', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    await ctx.reply('Buyruq tushunilmadi. Pastdagi menyudan tanlang yoki /help ni bosing.', keyboardFor((ctx.state as any).user?.role || 'buyer'));
+  });
+
+  bot.catch(async (err: any, ctx: any) => {
     console.error(`[Bot] Error handling ${ctx?.updateType}:`, err);
+    const detail = String(err?.description || err?.message || '');
+    if (/message is not modified|query is too old/i.test(detail)) return;
+    if (ctx?.callbackQuery) await ctx.answerCbQuery().catch(() => undefined);
+    await ctx?.reply?.('⚠️ Kutilmagan xatolik yuz berdi. Birozdan keyin qayta urinib ko‘ring.').catch(() => undefined);
   });
 
   if (config.botWebhookUrl) {
@@ -259,13 +276,14 @@ if (require.main === module) {
 
   app.post('/api/telegram/webhook', (req, res, next) => telegramWebhook(req, res, next));
 
+  // Bound first: the platform's port check must not depend on Mongo or Telegram being quick.
+  // Webhook deliveries that arrive before the bot is ready get a 503 and Telegram retries them.
+  app.listen(config.port, () => {
+    console.log(`[Bot] HTTP surface (health + webhook) listening on port ${config.port}`);
+  });
+
   connectDatabase()
     .then(startBot)
-    .then(() => {
-      app.listen(config.port, () => {
-        console.log(`[Bot] HTTP surface (health + webhook) listening on port ${config.port}`);
-      });
-    })
     .catch((err) => {
       console.error('[Bot] Fatal startup error:', err);
       process.exit(1);

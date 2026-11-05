@@ -92,6 +92,8 @@ function helpText(): string {
 }
 
 startHandler.help((ctx) => ctx.replyWithHTML(helpText()));
+// Inside a form the wizard guard answers /cancel; reaching here means no form is open.
+startHandler.command('cancel', (ctx) => ctx.reply('Hozir ochiq forma yo‘q.'));
 startHandler.hears(["❓ Yordam","Yordam"], (ctx) => ctx.replyWithHTML(helpText()));
 
 async function showBalance(ctx: any) {
@@ -167,7 +169,7 @@ startHandler.action('payout_request', async (ctx) => {
   if (!user) return;
 
   if (!user.payoutCard?.encrypted) {
-    await ctx.reply('Avval kartangizni saqlang: “💳 Kartani saqlash”.');
+    await ctx.reply('Avval kartangizni saqlang: “Kartani saqlash”.');
     return;
   }
   if (user.balance < config.minPayoutAmount) {

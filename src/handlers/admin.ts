@@ -21,17 +21,21 @@ export const adminHandler = new Composer();
 /** Resolves the acting admin, or null when the caller isn't one. */
 async function requireAdmin(ctx: any) {
   const telegramId = ctx.from?.id;
-  if (!telegramId || !isAdminTelegramId(telegramId)) return null;
-  return User.findOne({ telegramId });
+  if (telegramId && isAdminTelegramId(telegramId)) return User.findOne({ telegramId });
+  // A moderator sees this menu too, so tell them why a money screen stays closed.
+  if (telegramId && ctx.message && (await User.exists({ telegramId, role: 'moderator' }))) {
+    await ctx.reply('Bu bo‘lim faqat admin uchun.');
+  }
+  return null;
 }
 
-adminHandler.use(async (ctx, next) => {
+/** Moderators review listings and read disputes; money and account actions stay admin-only. */
+async function requireStaff(ctx: any) {
   const telegramId = ctx.from?.id;
-  if (telegramId && isAdminTelegramId(telegramId)) {
-    await User.updateOne({ telegramId, role: { $ne: 'admin' } }, { $set: { role: 'admin' } });
-  }
-  return next();
-});
+  if (!telegramId) return null;
+  const user = await User.findOne({ telegramId });
+  return user && (isAdminTelegramId(telegramId) || user.role === 'moderator') ? user : null;
+}
 
 adminHandler.hears(["👥 Foydalanuvchilar","Foydalanuvchilar"], async (ctx) => {
   if (!(await requireAdmin(ctx))) return;
@@ -95,8 +99,8 @@ adminHandler.command('setrole', async (ctx) => {
  * moderator, or to hand a user's seller/buyer role back after a mistake, without editing the
  * database by hand.
  *
- * Promoting to 'admin' is restricted to the platform owner specifically — not to every admin —
- * so a moderator or secondary admin can never mint another admin.
+ * Admin access itself comes only from ADMIN_CHAT_ID / ADMIN_IDS, so it is not offered here: a
+ * database role would look like access while granting none.
  */
 export function createRoleWizard() {
   return new Scenes.WizardScene<any>(
@@ -130,8 +134,6 @@ export function createRoleWizard() {
       }
 
       ctx.wizard.state.targetUserId = String(user._id);
-      const isOwner = String(ctx.from!.id) === config.adminChatId;
-
       const rows = [
         [
           { text: '🛍 Xaridor', callback_data: 'role_buyer' },
@@ -139,7 +141,6 @@ export function createRoleWizard() {
         ],
         [{ text: '🛡 Moderator', callback_data: 'role_moderator' }],
       ];
-      if (isOwner) rows.push([{ text: '👑 Admin', callback_data: 'role_admin' }]);
       rows.push([{ text: '❌ Bekor qilish', callback_data: 'role_cancel' }]);
 
       await ctx.replyWithHTML(
@@ -174,9 +175,8 @@ export function createRoleWizard() {
       }
 
       const newRole = match[1] as 'buyer' | 'seller' | 'moderator' | 'admin';
-      const isOwner = String(ctx.from!.id) === config.adminChatId;
-      if (newRole === 'admin' && !isOwner) {
-        await ctx.answerCbQuery('Faqat platforma egasi admin tayinlashi mumkin');
+      if (newRole === 'admin') {
+        await ctx.answerCbQuery('Admin faqat ADMIN_IDS orqali tayinlanadi');
         return;
       }
 
@@ -283,7 +283,7 @@ adminHandler.hears(["📊 Statistika","Statistika"], async (ctx) => {
 // ─── Moderation ────────────────────────────────────────────────────────────────
 
 adminHandler.hears(["🛡 Moderatsiya","Moderatsiya"], async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireStaff(ctx))) return;
 
   const queue = await Product.find({ status: 'pending_review' })
     .sort('createdAt')
@@ -327,7 +327,7 @@ adminHandler.hears(["🛡 Moderatsiya","Moderatsiya"], async (ctx) => {
 });
 
 adminHandler.action(/^mod_approve_(.+)$/, async (ctx) => {
-  const admin = await requireAdmin(ctx);
+  const admin = await requireStaff(ctx);
   if (!admin) return void ctx.answerCbQuery('Ruxsat yo‘q');
 
   const productId = ctx.match[1];
@@ -356,7 +356,7 @@ adminHandler.action(/^mod_approve_(.+)$/, async (ctx) => {
 });
 
 adminHandler.action(/^mod_reject_(.+)$/, async (ctx) => {
-  const admin = await requireAdmin(ctx);
+  const admin = await requireStaff(ctx);
   if (!admin) return void ctx.answerCbQuery('Ruxsat yo‘q');
 
   const productId = ctx.match[1];
@@ -533,7 +533,7 @@ adminHandler.action(/^inbox_(mute|unmute)_([a-f0-9]{24})$/, async (ctx) => {
 // ─── Disputes ──────────────────────────────────────────────────────────────────
 
 adminHandler.hears(["⚖️ Nizolar","Nizolar"], async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireStaff(ctx))) return;
 
   const disputes = await Dispute.find({ status: { $in: ['open', 'under_review'] } })
     .sort('slaDueAt')
@@ -563,8 +563,6 @@ adminHandler.hears(["⚖️ Nizolar","Nizolar"], async (ctx) => {
         `Sabab: ${escapeHtml(dispute.reason)}`,
         `Dalillar: ${dispute.evidence.length} ta`,
         `SLA: ${dispute.slaDueAt.toLocaleString('uz-UZ')}`,
-        '',
-        `<i>Hal qilish: /dispute_${dispute._id}</i>`,
       ].join('\n')
     );
   }
@@ -612,13 +610,14 @@ adminHandler.action(/^adm_delprod_(.+)$/, async (ctx) => {
   const admin = await requireAdmin(ctx);
   if (!admin) return void ctx.answerCbQuery('Ruxsat yo‘q');
 
-  const product = await Product.findByIdAndUpdate(
-    ctx.match[1],
-    { $set: { status: 'archived' } },
+  // Only while no sale is running: archiving a reserved or sold listing would orphan its order.
+  const product = await Product.findOneAndUpdate(
+    { _id: ctx.match[1], status: { $in: ['active', 'pending_review', 'draft', 'rejected'] } },
+    { $set: { status: 'archived' }, $unset: { dealCode: '' } },
     { new: true }
   ).catch(() => null);
 
-  if (!product) return void ctx.answerCbQuery('Mahsulot topilmadi');
+  if (!product) return void ctx.answerCbQuery('E’lon topilmadi yoki savdo boshlangan');
 
   await audit({
     actorId: admin._id as any,
@@ -628,7 +627,7 @@ adminHandler.action(/^adm_delprod_(.+)$/, async (ctx) => {
   });
 
   await ctx.answerCbQuery('🗑 Arxivlandi');
-  await ctx.reply(`🗑 E’lon arxivlandi: ${escapeHtml(product.title)}`);
+  await ctx.reply(`🗑 E’lon arxivlandi: ${product.title}`);
 });
 
 adminHandler.action(/^adm_details_(.+)$/, async (ctx) => {

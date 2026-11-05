@@ -37,18 +37,21 @@ class NotificationService {
   }
 
   async send(payload: NotifyPayload): Promise<boolean> {
-    if (!this.bot) {
-      console.warn('[Notify] Bot not initialized, message skipped:', payload.message.slice(0, 60));
+    if (!payload.chatId) return false;
+    if (!this.bot && !config.botToken) {
+      console.warn('[Notify] BOT_TOKEN not set, message skipped:', payload.message.slice(0, 60));
       return false;
     }
-    if (!payload.chatId) return false;
+
+    const options = {
+      parse_mode: 'HTML',
+      disable_notification: payload.silent,
+      ...(payload.buttons?.length ? { reply_markup: { inline_keyboard: payload.buttons } } : {}),
+    };
 
     try {
-      await this.bot.telegram.sendMessage(String(payload.chatId), payload.message, {
-        parse_mode: 'HTML',
-        disable_notification: payload.silent,
-        ...(payload.buttons?.length ? { reply_markup: { inline_keyboard: payload.buttons } } : {}),
-      });
+      if (this.bot) await this.bot.telegram.sendMessage(String(payload.chatId), payload.message, options);
+      else await this.sendViaHttp(String(payload.chatId), payload.message, options);
       return true;
     } catch (error: any) {
       // 403 means the user blocked the bot — expected, not an incident worth a stack trace.
@@ -60,6 +63,24 @@ class NotificationService {
       }
       return false;
     }
+  }
+
+  /**
+   * The API service runs without Telegraf, so it talks to the Bot API directly. Without this,
+   * every payment, settlement and admin alert raised by the API was silently dropped.
+   */
+  private async sendViaHttp(chatId: string, text: string, options: Record<string, unknown>) {
+    const response = await fetch(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, ...options }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.ok) return;
+    const body = (await response.json().catch(() => null)) as { description?: string } | null;
+    const error: any = new Error(body?.description || `Telegram HTTP ${response.status}`);
+    error.response = { error_code: response.status };
+    throw error;
   }
 
   async notifyAdmin(message: string, buttons?: any[]) {
