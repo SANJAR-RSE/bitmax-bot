@@ -1,4 +1,4 @@
-import { AlreadyProcessedError, ForbiddenError, ProductUnavailableError } from '../services/paymentService';
+import { AlreadyProcessedError, ForbiddenError, PaymentProviderError, ProductUnavailableError } from '../services/paymentService';
 import { ImageUploadError } from '../services/cloudinaryService';
 
 /**
@@ -18,6 +18,9 @@ export function describeError(error: unknown): string {
   }
   if (error instanceof ForbiddenError) {
     return `❌ ${(error as Error).message || 'Ruxsat yo‘q'}`;
+  }
+  if (error instanceof PaymentProviderError) {
+    return `⚠️ ${error.message}`;
   }
   if (error instanceof ImageUploadError) {
     return `⚠️ ${error.message}`;

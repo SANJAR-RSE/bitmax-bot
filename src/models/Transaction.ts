@@ -13,15 +13,12 @@ export interface ITransaction extends Document {
   /** Which of the configured cards the buyer was told to pay into. */
   cardId?: string;
 
-  paymentProvider?: 'sms' | 'tezcheck';
-  paymentUrl?: string;
-  tezcheckBillId?: string;
-  tezcheckRequest?: string;
-  tezcheckPaymentId?: string;
-  tezcheckAmountMinor?: number;
-  tezcheckFeeMinor?: number;
-  tezcheckNetMinor?: number;
-  tezcheckCheckedAt?: Date;
+  /** 'tezcheck' remains only so orders from that retired provider can still be read. */
+  paymentProvider?: 'sms' | 'tezcheck' | 'hamyon';
+  hamyonPaymentId?: string;
+  /** Card Hamyon assigned to this payment; removed once the order closes. */
+  paymentCard?: string;
+  hamyonCheckedAt?: Date;
   paymentReview?: string;
   paymentNotifiedAt?: Date;
   paymentReviewNotifiedAt?: Date;
@@ -51,15 +48,10 @@ const TransactionSchema = new Schema<ITransaction>(
     uniqueAmount: { type: Number, required: true, min: 0 },
     cardId: { type: String },
 
-    paymentProvider: { type: String, enum: ['sms', 'tezcheck'], default: 'sms' },
-    paymentUrl: String,
-    tezcheckBillId: String,
-    tezcheckRequest: String,
-    tezcheckPaymentId: String,
-    tezcheckAmountMinor: Number,
-    tezcheckFeeMinor: Number,
-    tezcheckNetMinor: Number,
-    tezcheckCheckedAt: Date,
+    paymentProvider: { type: String, enum: ['sms', 'tezcheck', 'hamyon'], default: 'sms' },
+    hamyonPaymentId: String,
+    paymentCard: String,
+    hamyonCheckedAt: Date,
     paymentReview: String,
     paymentNotifiedAt: Date,
     paymentReviewNotifiedAt: Date,
@@ -96,8 +88,7 @@ TransactionSchema.index(
   { unique: true, partialFilterExpression: { status: 'pending_payment' } }
 );
 
-TransactionSchema.index({ tezcheckPaymentId: 1 }, { unique: true, sparse: true });
-TransactionSchema.index({ tezcheckBillId: 1 }, { unique: true, sparse: true });
+TransactionSchema.index({ hamyonPaymentId: 1 }, { unique: true, sparse: true });
 
 // The expiry sweeper scans exactly this shape.
 TransactionSchema.index({ status: 1, expireAt: 1 });

@@ -20,7 +20,7 @@ import {
 } from './refundEngine';
 import { ledgerService, accounts } from './ledgerService';
 import { config } from '../config';
-import { toMinor } from './tezcheckClient';
+import { hamyonClient, HamyonDuplicateAmountError } from './hamyonClient';
 import { RefundQuote } from '../types';
 
 export class AlreadyProcessedError extends Error {
@@ -44,6 +44,14 @@ export class ForbiddenError extends Error {
   }
 }
 
+/** The payment provider could not open a payment; the listing has been released. */
+export class PaymentProviderError extends Error {
+  constructor(message = 'To‘lov xizmati vaqtincha ishlamayapti. Birozdan keyin qayta urinib ko‘ring.') {
+    super(message);
+    this.name = 'PaymentProviderError';
+  }
+}
+
 export interface SmsResult {
   matched: boolean;
   duplicate?: boolean;
@@ -63,15 +71,6 @@ export class PaymentService {
    * conditional update, so exactly one caller can win it.
    */
   async createPaymentTransaction(productId: string, buyerId: string) {
-    const existing = await Transaction.findOne({ productId, buyerId, status: 'pending_payment', paymentProvider: 'tezcheck' });
-    if (existing) {
-      const product = await Product.findById(productId);
-      if (!product) throw new ProductUnavailableError();
-      const { ensureTezcheckBill } = await import('./tezcheckPayments');
-      await ensureTezcheckBill(existing).catch(() => undefined);
-      return { transaction: existing, product, uniqueAmount: existing.basePrice,
-        paymentUrl: existing.paymentReview ? undefined : existing.paymentUrl, paymentProvider: 'tezcheck', expiresAt: existing.expireAt, card: null };
-    }
     const expireAt = new Date(Date.now() + config.paymentWindowMinutes * 60 * 1000);
 
     const product = await Product.findOneAndUpdate(
@@ -99,6 +98,8 @@ export class PaymentService {
       throw new ForbiddenError('O‘z mahsulotingizni sotib ololmaysiz');
     }
 
+    if (config.paymentProvider === 'hamyon') return this.createHamyonTransaction(product, buyerId, expireAt);
+
     const card = pickCard();
 
     for (let attempt = 0; attempt < 10; attempt++) {
@@ -107,10 +108,6 @@ export class PaymentService {
         const transactionId = new mongoose.Types.ObjectId();
         const transaction = await Transaction.create({
           _id: transactionId,
-          tezcheckRequest: config.paymentProvider === 'tezcheck' ? JSON.stringify({
-            amount_minor: toMinor(product.price), title: `Buyurtma #${transactionId}`,
-            external_reference: String(transactionId), allowed_provider_codes: config.tezcheck.providerCodes,
-          }) : undefined,
           productId: product._id,
           buyerId,
           sellerId: product.sellerId,
@@ -123,28 +120,20 @@ export class PaymentService {
           expireAt,
         });
 
-        if (config.paymentProvider === 'tezcheck') {
-          const { ensureTezcheckBill } = await import('./tezcheckPayments');
-          // A timeout may mean a bill exists remotely. Keep this order reserved for recovery.
-          await ensureTezcheckBill(transaction).catch(() => undefined);
-        }
         return {
           transaction,
           paymentProvider: transaction.paymentProvider,
-          paymentUrl: transaction.paymentUrl,
           product,
-          uniqueAmount: transaction.paymentProvider === 'tezcheck' ? transaction.basePrice : uniqueAmount,
+          uniqueAmount,
           expiresAt: expireAt,
-          card: transaction.paymentProvider !== 'tezcheck' && card
+          card: card
             ? { masked: maskCard(card.number), raw: card.number, holder: card.holder, bank: card.bank }
             : null,
         };
       } catch (err: any) {
         // E11000 = collided with another still-pending transaction's uniqueAmount; retry.
         if (err?.code === 11000) continue;
-        if (!await Transaction.exists({ productId: product._id, buyerId, status: 'pending_payment', paymentProvider: 'tezcheck' })) {
-          await this.releaseReservation(String(product._id));
-        }
+        await this.releaseReservation(String(product._id));
         throw err;
       }
     }
@@ -152,6 +141,69 @@ export class PaymentService {
     // Could not find a free amount — don't strand the listing in `reserved`.
     await this.releaseReservation(String(product._id));
     throw new Error('Could not allocate a unique payment amount, please try again');
+  }
+
+  /**
+   * Hamyon identifies a payment by its amount, so concurrent orders for one price take the next
+   * free so'm, as its documentation advises. A failed create is safe to abandon: the card is shown
+   * only after success, so nobody can have paid for it.
+   */
+  private async createHamyonTransaction(product: any, buyerId: string, expireAt: Date) {
+    for (let offset = 0; offset < 50; offset++) {
+      const amount = product.price + offset;
+      const transactionId = new mongoose.Types.ObjectId();
+      let transaction;
+      try {
+        transaction = await Transaction.create({
+          _id: transactionId,
+          productId: product._id,
+          buyerId,
+          sellerId: product.sellerId,
+          basePrice: product.price,
+          expectedAmount: product.price,
+          uniqueAmount: amount,
+          paymentProvider: 'hamyon',
+          status: 'pending_payment',
+          expireAt,
+        });
+      } catch (err: any) {
+        if (err?.code === 11000) continue;
+        await this.releaseReservation(String(product._id));
+        throw err;
+      }
+
+      let remote;
+      try {
+        remote = await hamyonClient.createPayment(amount, String(transactionId));
+      } catch (err) {
+        await Transaction.updateOne(
+          { _id: transactionId, status: 'pending_payment' },
+          { $set: { status: 'cancelled', cancelReason: 'hamyon_create_failed' } }
+        );
+        if (err instanceof HamyonDuplicateAmountError) continue;
+        await this.releaseReservation(String(product._id));
+        console.error('[Hamyon] Could not create payment:', (err as Error)?.message);
+        throw new PaymentProviderError();
+      }
+
+      transaction.hamyonPaymentId = remote.paymentId;
+      transaction.paymentCard = remote.card;
+      transaction.expireAt = remote.expireAt;
+      await transaction.save();
+      await Product.updateOne({ _id: product._id, status: 'reserved' }, { $set: { reservedUntil: remote.expireAt } });
+
+      return {
+        transaction,
+        paymentProvider: 'hamyon' as const,
+        product,
+        uniqueAmount: amount,
+        expiresAt: remote.expireAt,
+        card: { masked: maskCard(remote.card), raw: remote.card, holder: '', bank: '' },
+      };
+    }
+
+    await this.releaseReservation(String(product._id));
+    throw new PaymentProviderError('Hozir bu narxda ochiq to‘lovlar ko‘p. Birozdan keyin qayta urinib ko‘ring.');
   }
 
   /** Shared only after an authenticated payment has been atomically claimed. */
@@ -281,7 +333,7 @@ export class PaymentService {
         // same amount can never both succeed — the second finds no pending row left to claim.
         const transaction = await Transaction.findOneAndUpdate(
           {
-            paymentProvider: { $ne: 'tezcheck' },
+            paymentProvider: { $nin: ['tezcheck', 'hamyon'] },
             uniqueAmount: roundedAmount,
             status: 'pending_payment',
             expireAt: { $gt: new Date() },

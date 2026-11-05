@@ -4,6 +4,7 @@ import crypto from 'crypto';
 dotenv.config();
 
 const isProd = process.env.NODE_ENV === 'production';
+const paymentProvider = process.env.PAYMENT_PROVIDER || 'sms';
 
 function required(name: string, devFallback: string): string {
   const value = process.env[name];
@@ -114,17 +115,18 @@ export const config = {
   platformCommission: num('PLATFORM_COMMISSION', 7),
   refundTiers: parseRefundTiers(),
   paymentCards: parsePaymentCards(),
-  paymentProvider: process.env.PAYMENT_PROVIDER || 'sms',
-  tezcheck: {
-    apiKey: process.env.TEZCHECK_API_KEY || '',
-    cashDeskCode: process.env.TEZCHECK_CASH_DESK_CODE || '',
-    webhookSecret: process.env.TEZCHECK_WEBHOOK_SECRET || '',
-    baseUrl: process.env.TEZCHECK_BASE_URL || 'https://api.tezcheck.uz/api/merchant/v1',
-    providerCodes: (process.env.TEZCHECK_PROVIDER_CODES || 'click,payme').split(',').map(s => s.trim()).filter(Boolean),
+  paymentProvider,
+  hamyon: {
+    shopId: process.env.HAMYON_SHOP_ID || '',
+    shopKey: process.env.HAMYON_SHOP_KEY || '',
+    baseUrl: process.env.HAMYON_BASE_URL || 'https://hamyon-api.uz',
+    // Secret last segment of the complete_url given to Hamyon.
+    callbackToken: process.env.HAMYON_CALLBACK_TOKEN || '',
   },
 
   // How long a buyer has to transfer the unique amount before the reservation lapses.
-  paymentWindowMinutes: num('PAYMENT_WINDOW_MINUTES', 10),
+  // Hamyon closes every payment after five minutes, so the promise to the buyer must match.
+  paymentWindowMinutes: paymentProvider === 'hamyon' ? 5 : num('PAYMENT_WINDOW_MINUTES', 10),
   // After this long with no buyer action, escrow releases to the seller automatically.
   // The TZ requires this ("24 soatdan keyin pul sotuvchiga o'tadi") — the scheduler enforces it.
   autoReleaseHours: num('AUTO_RELEASE_HOURS', 24),
@@ -208,7 +210,7 @@ export function safeEquals(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-if (!['sms', 'tezcheck'].includes(config.paymentProvider)) throw new Error('Invalid PAYMENT_PROVIDER');
-if (config.paymentProvider === 'tezcheck' && (!config.tezcheck.apiKey || config.tezcheck.apiKey.includes('*') || !config.tezcheck.cashDeskCode || !config.tezcheck.webhookSecret)) {
-  throw new Error('TezCheck requires full API key, cash desk code and webhook secret');
+if (!['sms', 'hamyon'].includes(config.paymentProvider)) throw new Error('Invalid PAYMENT_PROVIDER');
+if (config.paymentProvider === 'hamyon' && (!config.hamyon.shopId || !config.hamyon.shopKey)) {
+  throw new Error('Hamyon requires HAMYON_SHOP_ID and HAMYON_SHOP_KEY');
 }

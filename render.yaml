@@ -42,13 +42,11 @@ services:
       # Payments: must match the backend service.
       - key: PAYMENT_PROVIDER
         sync: false
-      - key: TEZCHECK_API_KEY
-        sync: false
-      - key: TEZCHECK_CASH_DESK_CODE
-        sync: false
-      - key: TEZCHECK_WEBHOOK_SECRET
-        sync: false
       - key: PAYMENT_CARDS
+        sync: false
+      - key: HAMYON_SHOP_ID
+        sync: false
+      - key: HAMYON_SHOP_KEY
         sync: false
 
       # Seller photo uploads from the bot.
