@@ -191,6 +191,7 @@ export class PaymentService {
       transaction.expireAt = remote.expireAt;
       await transaction.save();
       await Product.updateOne({ _id: product._id, status: 'reserved' }, { $set: { reservedUntil: remote.expireAt } });
+      console.log('[Hamyon] Order created:', String(transactionId), 'payment', remote.paymentId, 'amount', amount, 'card ••••' + remote.card.slice(-4));
 
       return {
         transaction,

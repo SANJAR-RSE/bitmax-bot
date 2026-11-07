@@ -27,7 +27,10 @@ export function watchHamyonPayment(transactionId: string, expiresAt: Date, chatI
     busy = true;
     try {
       const t = await checkHamyonOrder(transactionId, intervalMs - 1_000);
-      if (!t || t.status !== 'pending_payment') return stop();
+      if (!t || t.status !== 'pending_payment') {
+        console.log('[Hamyon] Watcher done:', transactionId, t?.status || 'missing');
+        return stop();
+      }
       if (t.paymentReview) {
         stop();
         await notificationService.notifyBuyer(
@@ -36,7 +39,10 @@ export function watchHamyonPayment(transactionId: string, expiresAt: Date, chatI
         );
         return;
       }
-      if (Date.now() > giveUpAt) stop();
+      if (Date.now() > giveUpAt) {
+        console.log('[Hamyon] Watcher gave up (still pending):', transactionId);
+        stop();
+      }
     } catch {
       console.error('[Hamyon] Watcher check failed:', transactionId);
       if (Date.now() > giveUpAt) stop();
@@ -48,4 +54,5 @@ export function watchHamyonPayment(transactionId: string, expiresAt: Date, chatI
   const timer = setInterval(tick, intervalMs);
   timer.unref?.();
   watching.set(transactionId, timer);
+  console.log('[Hamyon] Watching:', transactionId);
 }

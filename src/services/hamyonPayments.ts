@@ -87,6 +87,7 @@ export async function notifyAdminHamyonReview(id: string, reason: string) {
     ].join('\n'),
     hamyonReviewButtons(String(t._id))
   );
+  console.log('[Hamyon] Admin review notice:', id, sent ? 'sent' : 'FAILED');
   if (sent) await Transaction.updateOne({ _id: t._id }, { $set: { paymentReviewNotifiedAt: new Date() } });
   return sent;
 }
@@ -195,6 +196,7 @@ export async function notifyHamyonPaid(id: string): Promise<boolean> {
   ]);
   const sent = !!buyer?.telegramId && !!hold &&
     await notificationService.notifyPaymentConfirmed(buyer.telegramId, product?.title || 'Mahsulot', t.basePrice, String(hold._id), hold.autoReleaseAt);
+  console.log('[Hamyon] Paid notice to buyer:', id, sent ? 'sent' : 'FAILED');
   if (!sent) await Transaction.updateOne({ _id: t._id }, { $unset: { paymentNotifiedAt: '' } });
   return sent;
 }
@@ -212,6 +214,7 @@ export async function checkHamyonOrder(id: string, minIntervalMs = 5_000) {
 /** A buyer says they paid an order Hamyon cancelled: re-ask Hamyon, then hand it to an admin. */
 export async function claimHamyonPaid(id: string, buyerId: string): Promise<'settled' | 'review' | 'already' | 'invalid'> {
   const t = await Transaction.findOne({ _id: id, buyerId, paymentProvider: 'hamyon' });
+  console.log('[Hamyon] Buyer claim:', id, t ? `${t.status}/${t.cancelReason || '-'}/${t.paymentReview || '-'}` : 'not found');
   if (!t) return 'invalid';
   if (t.status === 'paid' || t.status === 'completed') return 'already';
   if (t.paymentReview) return 'review';
@@ -232,6 +235,7 @@ export async function claimHamyonPaid(id: string, buyerId: string): Promise<'set
 /** Admin decision on a reviewed order. */
 export async function resolveHamyonReview(id: string, approve: boolean, adminId: string) {
   const t = await Transaction.findById(id);
+  console.log('[Hamyon] Admin decision:', id, approve ? 'approve' : 'reject', t ? t.status : 'not found');
   if (!t || t.paymentProvider !== 'hamyon') return { ok: false, message: 'Buyurtma topilmadi' };
   if (t.status === 'paid' || t.status === 'completed') return { ok: false, message: 'Allaqachon tasdiqlangan' };
   const buyer = await User.findById(t.buyerId);

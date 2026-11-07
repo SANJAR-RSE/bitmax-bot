@@ -218,6 +218,7 @@ buyerHandler.action(/^buy_(.+)$/, async (ctx) => {
     });
     watchHamyonPayment(transactionId, new Date(expiresAt), ctx.from!.id);
   } catch (error: any) {
+    console.error('[Bot] Purchase failed:', ctx.match?.[1], error?.name, error?.message);
     await ctx.reply(describeError(error));
   }
 });
