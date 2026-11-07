@@ -7,6 +7,8 @@ import { Transaction } from '../models/Transaction';
 import { botApi } from '../services/botApi';
 import { notificationService } from '../services/notificationService';
 import { paymentService } from '../services/paymentService';
+import { checkHamyonOrder } from '../services/hamyonPayments';
+import { watchHamyonPayment } from '../services/hamyonWatcher';
 import { describeRefundPolicy } from '../services/refundEngine';
 import { config } from '../config';
 import { escapeHtml, formatUzs, formatDeadline, formatCardNumber } from '../utils/helpers';
@@ -171,7 +173,7 @@ buyerHandler.action(/^buy_(.+)$/, async (ctx) => {
     }
 
     await ctx.answerCbQuery('To‘lov tayyorlanmoqda…');
-    const { product, uniqueAmount, card, expiresAt } = await botApi.initiatePurchase(
+    const { transaction, product, uniqueAmount, card, expiresAt } = await botApi.initiatePurchase(
       productId,
       user._id.toString()
     );
@@ -209,7 +211,12 @@ buyerHandler.action(/^buy_(.+)$/, async (ctx) => {
       `<i>To‘lov tushgach, bot sizga avtomatik xabar yuboradi.</i>`,
     ].join('\n');
 
-    await ctx.editMessageText(paymentMessage, { parse_mode: 'HTML' });
+    const transactionId = String(transaction._id);
+    await ctx.editMessageText(paymentMessage, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔄 To‘lovni tekshirish', callback_data: `payment_status_${transactionId}` }]] },
+    });
+    watchHamyonPayment(transactionId, new Date(expiresAt), ctx.from!.id);
   } catch (error: any) {
     await ctx.reply(describeError(error));
   }
@@ -218,14 +225,26 @@ buyerHandler.action(/^buy_(.+)$/, async (ctx) => {
 buyerHandler.action(/^payment_status_([a-f0-9]{24})$/, async (ctx) => {
   const user = await User.findOne({ telegramId: ctx.from!.id, isBlocked: { $ne: true } });
   if (!user) { await ctx.answerCbQuery('Ruxsat yo‘q'); return; }
-  const t = await Transaction.findOne({ _id: ctx.match[1], buyerId: user._id });
+  if (!await Transaction.exists({ _id: ctx.match[1], buyerId: user._id })) { await ctx.answerCbQuery('Buyurtma topilmadi'); return; }
+  let t;
+  try {
+    t = await checkHamyonOrder(ctx.match[1], 3_000);
+  } catch {
+    console.error('[Hamyon] Manual check failed:', ctx.match[1]);
+    t = await Transaction.findById(ctx.match[1]);
+  }
   if (!t) { await ctx.answerCbQuery('Buyurtma topilmadi'); return; }
   if (t.status === 'paid' || t.status === 'completed') {
     const hold = await EscrowHold.findOne({ transactionId: t._id });
     await ctx.answerCbQuery('To‘lov tasdiqlangan');
-    if (hold) await ctx.replyWithHTML('✅ To‘lov tasdiqlandi. Buyurtmangiz:', revealButton(String(hold._id)));
+    if (hold) await ctx.replyWithHTML('✅ To‘lov tasdiqlandi. Akkaunt ma’lumotlarini oching:', revealButton(String(hold._id)));
   } else {
-    await ctx.answerCbQuery(t.paymentReview ? 'To‘lov qo‘lda tekshirilmoqda' : t.status === 'pending_payment' ? 'To‘lov kutilmoqda — avtomatik tekshiriladi' : 'Buyurtma yopilgan');
+    await ctx.answerCbQuery(
+      t.paymentReview ? 'To‘lov qo‘lda tekshirilmoqda — qayta pul o‘tkazmang'
+        : t.status === 'pending_payment' ? 'To‘lov hali tushmadi. Bir necha soniyadan keyin yana bosing.'
+          : 'Buyurtma yopilgan (muddat tugagan)',
+      { show_alert: true }
+    );
   }
 });
 
