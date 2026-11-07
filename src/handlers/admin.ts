@@ -10,6 +10,7 @@ import { Dispute } from '../models/Dispute';
 import { audit } from '../models/AuditLog';
 import { notificationService } from '../services/notificationService';
 import { payoutService } from '../services/payoutService';
+import { resolveHamyonReview } from '../services/hamyonPayments';
 import { ledgerService, accounts } from '../services/ledgerService';
 import { adminMenuKeyboard, moderationButtons, payoutButtons } from '../keyboards';
 import { config, isAdminTelegramId } from '../config';
@@ -433,6 +434,30 @@ adminHandler.action(/^po_reveal_(.+)$/, async (ctx) => {
     await ctx.answerCbQuery('Ko‘rsatildi (audit qilindi)');
   } catch (error: any) {
     await ctx.answerCbQuery(error.message);
+  }
+});
+
+adminHandler.action(/^hpay_(ok|no)_([a-f0-9]{24})$/, async (ctx) => {
+  const admin = await requireAdmin(ctx);
+  if (!admin) return void ctx.answerCbQuery('Ruxsat yo‘q');
+  try {
+    const approve = ctx.match[1] === 'ok';
+    const result = await resolveHamyonReview(ctx.match[2], approve, String(admin._id));
+    await ctx.answerCbQuery(result.message, { show_alert: !result.ok });
+    if (result.ok) {
+      await audit({
+        actorId: admin._id as any,
+        actorTelegramId: ctx.from!.id,
+        action: approve ? 'payment.hamyon_manual_approve' : 'payment.hamyon_manual_reject',
+        targetType: 'Transaction',
+        targetId: new mongoose.Types.ObjectId(ctx.match[2]),
+      });
+      await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+      await ctx.reply(`${approve ? '✅' : '❌'} ${result.message} · <code>${ctx.match[2]}</code>`, { parse_mode: 'HTML' });
+    }
+  } catch (error: any) {
+    console.error('[Hamyon] Admin review failed:', ctx.match[2], error?.message);
+    await ctx.answerCbQuery('Xatolik — qayta urinib ko‘ring', { show_alert: true });
   }
 });
 

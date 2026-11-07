@@ -7,7 +7,7 @@ import { Transaction } from '../models/Transaction';
 import { botApi } from '../services/botApi';
 import { notificationService } from '../services/notificationService';
 import { paymentService } from '../services/paymentService';
-import { checkHamyonOrder } from '../services/hamyonPayments';
+import { checkHamyonOrder, claimHamyonPaid } from '../services/hamyonPayments';
 import { watchHamyonPayment } from '../services/hamyonWatcher';
 import { describeRefundPolicy } from '../services/refundEngine';
 import { config } from '../config';
@@ -427,8 +427,31 @@ buyerHandler.hears(["📦 Mening buyurtmalarim","Mening buyurtmalarim","📦 Buy
       ].join('\n'),
       t.status === 'pending_payment' ? { reply_markup: { inline_keyboard: [
         [{ text: '🔄 Holatni tekshirish', callback_data: `payment_status_${t._id}` }],
-      ] } } : undefined
+      ] } }
+        : t.paymentProvider === 'hamyon' && !t.paymentReview && Date.now() - new Date(t.expireAt).getTime() < 24 * 3600_000
+          ? { reply_markup: { inline_keyboard: [[{ text: '💸 Men pul o‘tkazgandim', callback_data: `hpay_claim_${t._id}` }]] } }
+          : undefined
     );
+  }
+});
+
+buyerHandler.action(/^hpay_claim_([a-f0-9]{24})$/, async (ctx) => {
+  const user = await User.findOne({ telegramId: ctx.from!.id, isBlocked: { $ne: true } });
+  if (!user) return void ctx.answerCbQuery('Ruxsat yo‘q');
+  await ctx.answerCbQuery('Tekshirilmoqda…');
+  try {
+    const result = await claimHamyonPaid(ctx.match[1], String(user._id));
+    const text = {
+      settled: '✅ To‘lov topildi! Hozir akkaunt ma’lumotlarini ochish tugmasi keladi.',
+      already: '✅ Bu buyurtma allaqachon to‘langan. «🛍 Xaridlarim» bo‘limidan ma’lumotlarni oching.',
+      review: '⏳ So‘rovingiz adminga yuborildi. Admin kartaga pul tushganini tekshirib, tasdiqlagach shu yerga akkaunt ma’lumotlari tugmasi keladi. Qayta pul o‘tkazmang.',
+      invalid: 'Bu buyurtma uchun so‘rov yuborib bo‘lmaydi (24 soatdan oshgan). Yordam uchun admin bilan bog‘laning.',
+    }[result];
+    await ctx.reply(text);
+    if (result !== 'settled' && result !== 'already') await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+  } catch {
+    console.error('[Hamyon] Claim failed:', ctx.match[1]);
+    await ctx.reply('Hozir tekshirib bo‘lmadi. Birozdan keyin qayta bosing.');
   }
 });
 
