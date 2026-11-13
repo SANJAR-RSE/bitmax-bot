@@ -550,6 +550,12 @@ export function createSellerWizard() {
       if (await bailIfCancelled(ctx, ['productData'])) return;
 
       const text = ctx.message?.text?.trim();
+      // Checked here, not at save time: 4000 is the schema limit, and failing only after the
+      // seller has typed the login, password and photos throws all of that away.
+      if (text && text.length > 4000) {
+        await ctx.reply(`Tavsif 4000 belgidan oshmasin (hozir ${text.length}). Qisqartirib qayta yuboring.`);
+        return;
+      }
       if (!text || text.length < 20) {
         await ctx.replyWithHTML(
           `Tavsif kamida 20 belgi bo‘lishi kerak. “${escapeHtml(ctx.session.productData.title)}” haqida batafsil yozing:`

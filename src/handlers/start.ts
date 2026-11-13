@@ -9,7 +9,7 @@ import { payoutService, InsufficientBalanceError } from '../services/payoutServi
 import { ledgerService } from '../services/ledgerService';
 import { describeRefundPolicy } from '../services/refundEngine';
 import { config } from '../config';
-import { escapeHtml, formatUzs } from '../utils/helpers';
+import { escapeHtml, formatUzs, parseSomInput } from '../utils/helpers';
 import { bailIfCancelled } from '../wizards/guard';
 import {
   mainMenu,
@@ -307,11 +307,15 @@ export function createPayoutWizards() {
     async (ctx: any) => {
       if (await bailIfCancelled(ctx)) return;
 
-      const amount = parseInt(String(ctx.message?.text || '').replace(/\D/g, ''), 10);
+      const amount = parseSomInput(String(ctx.message?.text || ''));
       const user = await User.findOne({ telegramId: ctx.from!.id });
       if (!user) return ctx.scene.leave();
 
-      if (isNaN(amount) || amount < config.minPayoutAmount) {
+      if (amount === null) {
+        await ctx.reply('Summani faqat raqam bilan kiriting, masalan: 150000 yoki 150 000. Qaytadan kiriting:');
+        return;
+      }
+      if (amount < config.minPayoutAmount) {
         await ctx.reply(`Minimal ${formatUzs(config.minPayoutAmount)}. Qaytadan kiriting:`);
         return;
       }

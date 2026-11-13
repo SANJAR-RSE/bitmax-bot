@@ -134,6 +134,24 @@ export function quoteRefund(options: QuoteOptions): RefundQuote {
 
   const split = calculateRefundAmount(amount, tier.penaltyPercent);
 
+  // A buyer past the refund-abuse threshold no longer gets automatic refunds once they hold the
+  // goods; an admin settles it by arbitration. (Unrevealed orders are handled above: nothing
+  // was delivered, so they always refund in full.)
+  if (options.requiresArbitration) {
+    return {
+      allowed: false,
+      period: tier.id,
+      label: tier.label,
+      penaltyPercent: tier.penaltyPercent,
+      ...split,
+      elapsedMinutes,
+      requiresArbitration: true,
+      message:
+        'So‘nggi 30 kunda ko‘p qaytarish qayd etilgani uchun avtomatik qaytarish o‘chirilgan. ' +
+        'So‘rovingizni admin ko‘rib chiqadi — nizo (dispute) oching.',
+    };
+  }
+
   return {
     allowed: true,
     period: tier.id,

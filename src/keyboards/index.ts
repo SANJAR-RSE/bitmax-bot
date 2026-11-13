@@ -97,6 +97,25 @@ export function escrowActionButtons(escrowId: string) {
       Markup.button.callback('Qayta ko‘rish', `reveal_${escrowId}`),
       Markup.button.callback('Yordam', `help_escrow_${escrowId}`),
     ],
+    [Markup.button.callback('⚖️ Nizo ochish', `dsp_open_${escrowId}`)],
+  ]);
+}
+
+/** `dsp_cat_` = dispute category picked, `dsp_do_` = open it. Longest: dsp_do_not_working_ + 24 = 43 bytes. */
+export function disputeReasonButtons(escrowId: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Akkaunt ishlamayapti', `dsp_cat_not_working_${escrowId}`)],
+    [Markup.button.callback('Ma’lumot noto‘g‘ri', `dsp_cat_wrong_info_${escrowId}`)],
+    [Markup.button.callback('Asl egasi qaytarib oldi', `dsp_cat_recovered_${escrowId}`)],
+    [Markup.button.callback('Boshqa sabab', `dsp_cat_other_${escrowId}`)],
+    [Markup.button.callback('Bekor qilish', `refund_cancel_${escrowId}`)],
+  ]);
+}
+
+export function disputeConfirmButtons(escrowId: string, reasonType: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Ha, nizo ochaman', `dsp_do_${reasonType}_${escrowId}`)],
+    [Markup.button.callback('Bekor qilish', `refund_cancel_${escrowId}`)],
   ]);
 }
 

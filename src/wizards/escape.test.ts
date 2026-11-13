@@ -46,3 +46,21 @@ test('the form keeps its own buttons, and nothing changes outside a form', async
   await wizardEscape({ session: {}, callbackQuery: { data: 'confirm_escrow_1' } }, async () => { continued = true; });
   assert.equal(continued, true);
 });
+
+test('every menu label the bot answers to leaves a form, old emoji labels included', async () => {
+  for (const text of ['💰 Balans', '📦 Buyurtmalarim', '🛍 Mahsulotlar', '⚖️ Nizolar', '💸 To‘lov so‘rovlari', 'Statistika', '🏠 Asosiy menu']) {
+    const ctx = inWizard({ message: { text } });
+    let passedOn = false;
+    await wizardEscape(ctx, async () => { passedOn = true; });
+    assert.equal(passedOn, true, text);
+    assert.equal(ctx.session.__scenes, undefined, `${text} leaves the form`);
+  }
+});
+
+test('text that only resembles a menu label stays form input', async () => {
+  for (const text of ['Balans haqida', 'Instagram Balans', 'Yordam kerak']) {
+    const ctx = inWizard({ message: { text } });
+    await wizardEscape(ctx, async () => undefined);
+    assert.ok(ctx.session.__scenes, text);
+  }
+});

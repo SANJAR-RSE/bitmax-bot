@@ -7,7 +7,7 @@ import { PaymentInbox } from '../models/PaymentInbox';
 import { audit } from '../models/AuditLog';
 import {
   generateUniqueAmount,
-  extractAmountFromSms,
+  extractSmsAmount,
   looksLikeIncomingPayment,
   smsFingerprint,
   maskCard,
@@ -52,10 +52,22 @@ export class PaymentProviderError extends Error {
   }
 }
 
+/** How many unpaid orders one buyer may hold open at once. */
+export const MAX_OPEN_PAYMENTS = 2;
+
+export class OpenPaymentLimitError extends Error {
+  constructor(
+    message = 'Sizda yakunlanmagan to‘lovlar bor. Avval ularni to‘lang yoki muddati tugashini kuting (bir necha daqiqa).'
+  ) {
+    super(message);
+    this.name = 'OpenPaymentLimitError';
+  }
+}
+
 export interface SmsResult {
   matched: boolean;
   duplicate?: boolean;
-  reason?: 'duplicate' | 'unparseable' | 'outgoing' | 'no_match';
+  reason?: 'duplicate' | 'unparseable' | 'outgoing' | 'no_match' | 'ambiguous';
   transaction?: any;
   amount?: number;
   inboxId?: string;
@@ -72,6 +84,12 @@ export class PaymentService {
    */
   async createPaymentTransaction(productId: string, buyerId: string) {
     const expireAt = new Date(Date.now() + config.paymentWindowMinutes * 60 * 1000);
+
+    // A reservation costs nothing until paid, so without a cap one account could tap "buy" on
+    // every listing and keep the whole catalog reserved — and, with Hamyon, use up the 50 free
+    // amounts per price so real buyers cannot open a payment at all.
+    const open = await Transaction.countDocuments({ buyerId, status: 'pending_payment', expireAt: { $gt: new Date() } });
+    if (open >= MAX_OPEN_PAYMENTS) throw new OpenPaymentLimitError();
 
     const product = await Product.findOneAndUpdate(
       {
@@ -241,15 +259,22 @@ export class PaymentService {
       { session }
     );
 
-    // Money enters the system from the bank and lands in this order's escrow account.
+    // Money enters the system from the bank and lands in this order's escrow account. The buyer
+    // actually transfers `uniqueAmount` (price plus a small tail that tells concurrent orders
+    // apart); the tail is not part of the sale, so it goes to platform revenue. Recording only
+    // the price would leave the ledger short of what reached the bank card.
+    const received = Math.max(transaction.uniqueAmount ?? transaction.basePrice, transaction.basePrice);
+    const surplus = received - transaction.basePrice;
+    const postings = [
+      { account: accounts.externalBank, amount: -received },
+      { account: accounts.escrow(String(hold._id)), amount: transaction.basePrice },
+    ];
+    if (surplus > 0) postings.push({ account: accounts.platformRevenue, amount: surplus });
     await ledgerService.post(
       {
         key: `payment:${transaction._id}`,
         type: 'payment_received',
-        postings: [
-          { account: accounts.externalBank, amount: -transaction.basePrice },
-          { account: accounts.escrow(String(hold._id)), amount: transaction.basePrice },
-        ],
+        postings,
         refType: 'Transaction',
         refId: transaction._id as mongoose.Types.ObjectId,
         meta,
@@ -266,10 +291,16 @@ export class PaymentService {
     return hold;
   }
 
-  /** Returns a reserved-but-unpaid product to the catalog. */
-  async releaseReservation(productId: string, session?: mongoose.ClientSession) {
+  /**
+   * Returns a reserved-but-unpaid product to the catalog. Pass `heldBy` whenever the caller acts
+   * for one specific buyer: by then the listing may be reserved by somebody else, and that
+   * buyer's reservation must survive.
+   */
+  async releaseReservation(productId: string, session?: mongoose.ClientSession, heldBy?: string) {
+    const filter: Record<string, unknown> = { _id: productId, status: 'reserved' };
+    if (heldBy) filter.reservedBy = new mongoose.Types.ObjectId(heldBy);
     return Product.findOneAndUpdate(
-      { _id: productId, status: 'reserved' },
+      filter,
       { $set: { status: 'active' }, $unset: { reservedBy: '', reservedUntil: '' } },
       session ? { session } : {}
     );
@@ -312,15 +343,23 @@ export class PaymentService {
       return { matched: false, reason: 'outgoing', inboxId: String(inbox._id) };
     }
 
-    const detectedAmount = extractAmountFromSms(smsText);
-    if (!detectedAmount) {
+    const parsed = extractSmsAmount(smsText);
+    if (!parsed) {
       inbox.status = 'ignored';
       inbox.resolutionNote = 'Summani ajratib bo‘lmadi';
       await inbox.save();
       return { matched: false, reason: 'unparseable', inboxId: String(inbox._id) };
     }
+    const detectedAmount = parsed.amount;
 
     inbox.parsedAmount = detectedAmount;
+    if (parsed.ambiguous) {
+      // Money arrived, but the amount could be read two ways. Guessing could settle somebody
+      // else's order, so it stays unmatched for an operator, who is alerted like any other.
+      inbox.resolutionNote = 'Summa noaniq (oldida boshqa raqamlar bor) — qo‘lda tekshiring';
+      await inbox.save();
+      return { matched: false, reason: 'ambiguous', amount: detectedAmount, inboxId: String(inbox._id) };
+    }
     await inbox.save();
 
     const roundedAmount = Math.round(detectedAmount);
@@ -414,27 +453,34 @@ export class PaymentService {
     escrowHoldId: string,
     buyerUserId: string
   ): Promise<{ credentials: ISensitiveData; hold: IEscrowHold; firstReveal: boolean }> {
-    const hold = await EscrowHold.findById(escrowHoldId);
-    if (!hold) throw new Error('Escrow hold not found');
-    if (String(hold.buyerId) !== String(buyerUserId)) throw new ForbiddenError();
-    if (hold.status !== 'holding') {
-      throw new AlreadyProcessedError('Bu buyurtma yopilgan, ma’lumotlar mavjud emas');
-    }
+    const existing = await EscrowHold.findById(escrowHoldId);
+    if (!existing) throw new Error('Escrow hold not found');
+    if (String(existing.buyerId) !== String(buyerUserId)) throw new ForbiddenError();
+
+    // Both writes are conditional on the hold still being open. A plain read-then-save let a
+    // reveal and the unopened-order auto-refund interleave: the buyer got the credentials *and*
+    // a full refund, and the listing went back on sale with the same login.
+    const owned = { _id: existing._id, buyerId: existing.buyerId, status: 'holding' };
+    const revealedAt = new Date();
+    let hold = await EscrowHold.findOneAndUpdate(
+      { ...owned, credentialsRevealedAt: { $exists: false } },
+      {
+        $set: {
+          credentialsRevealedAt: revealedAt,
+          autoReleaseAt: new Date(revealedAt.getTime() + config.autoReleaseHours * 3600_000),
+          refundDeadlineAt: refundDeadlineFrom(revealedAt),
+        },
+        $inc: { credentialRevealCount: 1 },
+      },
+      { new: true }
+    );
+    const firstReveal = Boolean(hold);
+    if (!hold) hold = await EscrowHold.findOneAndUpdate(owned, { $inc: { credentialRevealCount: 1 } }, { new: true });
+    if (!hold) throw new AlreadyProcessedError('Bu buyurtma yopilgan, ma’lumotlar mavjud emas');
 
     const product = await Product.findById(hold.productId);
     if (!product) throw new Error('Product not found');
-
     const credentials = product.getCredentials();
-    const firstReveal = !hold.credentialsRevealedAt;
-
-    if (firstReveal) {
-      const revealedAt = new Date();
-      hold.credentialsRevealedAt = revealedAt;
-      hold.autoReleaseAt = new Date(revealedAt.getTime() + config.autoReleaseHours * 3600_000);
-      hold.refundDeadlineAt = refundDeadlineFrom(revealedAt);
-    }
-    hold.credentialRevealCount += 1;
-    await hold.save();
 
     await audit({
       actorId: hold.buyerId,
@@ -469,9 +515,11 @@ export class PaymentService {
   private async claimHolding(
     escrowHoldId: string,
     update: Record<string, any>,
-    session: mongoose.ClientSession
+    session: mongoose.ClientSession,
+    extraFilter: Record<string, unknown> = {},
+    fromStatus: 'holding' | 'disputed' = 'holding'
   ) {
-    return EscrowHold.findOneAndUpdate({ _id: escrowHoldId, status: 'holding' }, update, {
+    return EscrowHold.findOneAndUpdate({ ...extraFilter, _id: escrowHoldId, status: fromStatus }, update, {
       new: true,
       session,
     });
@@ -482,12 +530,18 @@ export class PaymentService {
    * is split between the seller (compensation) and the platform (its commission on that
    * share) — see refundEngine for why the buyer's percentage is the fixed promise.
    */
-  async processRefund(escrowHoldId: string, reason: string, actorId?: string) {
+  async processRefund(escrowHoldId: string, reason: string, actorId?: string, opts: { onlyIfUnopened?: boolean } = {}) {
     const existing = await EscrowHold.findById(escrowHoldId);
     if (!existing) throw new Error('Escrow hold not found');
     if (existing.status !== 'holding') throw new AlreadyProcessedError();
 
     const quote = await this.quoteRefundFor(escrowHoldId);
+
+    // The unopened-order job decided from a snapshot; if the buyer has opened it since, this is
+    // no longer that refund and must not happen.
+    if (opts.onlyIfUnopened && quote.period !== 'not_revealed') {
+      return { allowed: false, quote, message: 'Ma’lumotlar ochilgan — avtomatik qaytarish bekor qilindi' };
+    }
 
     if (!quote.allowed) {
       return { allowed: false, quote, message: quote.message };
@@ -506,9 +560,15 @@ export class PaymentService {
       period: quote.period,
       penaltyPercent: quote.penaltyPercent,
       actorId,
+      // The quote depends on whether the credentials were opened. If that changes between the
+      // quote and the claim (a reveal lands mid-refund), the claim fails instead of paying an
+      // "unopened" full refund to a buyer who now holds the login.
+      claimFilter: { credentialsRevealedAt: { $exists: quote.period !== 'not_revealed' } },
     });
 
-    await this.recordBuyerRefund(String(existing.buyerId));
+    // Only a refund after taking the goods is the abuse pattern. An order the buyer never opened
+    // (including the automatic refund of unopened orders) delivered nothing and must not count.
+    if (quote.period !== 'not_revealed') await this.recordBuyerRefund(String(existing.buyerId));
 
     return {
       allowed: true,
@@ -577,6 +637,9 @@ export class PaymentService {
       period?: string;
       penaltyPercent?: number;
       actorId?: string;
+      claimFilter?: Record<string, unknown>;
+      /** Which open state the hold must be in to be settled; arbitration settles a disputed one. */
+      fromStatus?: 'holding' | 'disputed';
     }
   ) {
     const session = await mongoose.startSession();
@@ -591,7 +654,7 @@ export class PaymentService {
           update.$set.refundPeriod = opts.period;
           update.$push = {
             refundLog: {
-              action: (opts.penaltyPercent ?? 0) > 0 ? 'partial' : 'approved',
+              action: opts.period === 'arbitration' ? 'arbitration' : (opts.penaltyPercent ?? 0) > 0 ? 'partial' : 'approved',
               period: opts.period || 'n/a',
               penaltyPercent: opts.penaltyPercent ?? 0,
               refundAmount: opts.buyerAmount,
@@ -602,7 +665,7 @@ export class PaymentService {
           };
         }
 
-        const escrow = await this.claimHolding(escrowHoldId, update, session);
+        const escrow = await this.claimHolding(escrowHoldId, update, session, opts.claimFilter, opts.fromStatus);
         if (!escrow) throw new AlreadyProcessedError();
 
         const total = opts.buyerAmount + opts.sellerAmount + opts.platformAmount;
@@ -693,17 +756,21 @@ export class PaymentService {
     note: string,
     adminUserId: string
   ) {
+    const toBuyer = split.buyerAmount > 0;
+    const fullRefund = toBuyer && split.sellerAmount === 0 && split.platformAmount === 0;
     await this.settleEscrow(escrowHoldId, {
       ...split,
-      escrowStatus: split.buyerAmount > 0 ? 'partial_refunded' : 'released',
-      transactionStatus: split.buyerAmount > 0 ? 'refunded' : 'completed',
-      productStatus: split.buyerAmount > 0 ? 'refunded' : 'sold',
-      ledgerType: split.buyerAmount > 0 ? 'escrow_refund' : 'escrow_release',
+      escrowStatus: fullRefund ? 'refunded' : toBuyer ? 'partial_refunded' : 'released',
+      transactionStatus: toBuyer ? 'refunded' : 'completed',
+      productStatus: toBuyer ? 'refunded' : 'sold',
+      ledgerType: toBuyer ? 'escrow_refund' : 'escrow_release',
       ledgerKey: `arbitration:${escrowHoldId}`,
       reason: note,
       period: 'arbitration',
       penaltyPercent: 0,
       actorId: adminUserId,
+      // Only a hold frozen by a dispute is settled by hand; an open one follows the normal rules.
+      fromStatus: 'disputed',
     });
   }
 

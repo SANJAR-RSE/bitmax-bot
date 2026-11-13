@@ -1,7 +1,8 @@
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 
-dotenv.config();
+// Tests run on defaults only; see src/testEnv.ts.
+if (process.env.NODE_ENV !== 'test') dotenv.config();
 
 const isProd = process.env.NODE_ENV === 'production';
 const paymentProvider = process.env.PAYMENT_PROVIDER || 'sms';

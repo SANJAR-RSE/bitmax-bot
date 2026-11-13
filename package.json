@@ -7,7 +7,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test \"src/**/*.test.ts\""
+    "test": "node --import tsx --import ./src/testEnv.ts --test \"src/**/*.test.ts\"",
+    "test:int": "node --import tsx --import ./src/testEnv.ts --test --test-concurrency=1 \"src/**/*.int.ts\""
   },
   "dependencies": {
     "dotenv": "^16.4.1",
@@ -15,11 +16,12 @@
     "helmet": "^7.2.0",
     "mongoose": "^8.1.0",
     "telegraf": "^4.16.3",
-    "zod": "^3.22.4"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.5",
+    "mongodb-memory-server": "^10.4.3",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   }

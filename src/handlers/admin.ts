@@ -11,6 +11,8 @@ import { audit } from '../models/AuditLog';
 import { notificationService } from '../services/notificationService';
 import { payoutService } from '../services/payoutService';
 import { resolveHamyonReview } from '../services/hamyonPayments';
+import { DisputeOutcome, disputeAdminButtons, resolveDispute } from '../services/disputeService';
+import { sendEvidenceTo } from './evidence';
 import { ledgerService, accounts } from '../services/ledgerService';
 import { adminMenuKeyboard, moderationButtons, payoutButtons } from '../keyboards';
 import { config, isAdminTelegramId } from '../config';
@@ -588,8 +590,35 @@ adminHandler.hears(["⚖️ Nizolar","Nizolar"], async (ctx) => {
         `Sabab: ${escapeHtml(dispute.reason)}`,
         `Dalillar: ${dispute.evidence.length} ta`,
         `SLA: ${dispute.slaDueAt.toLocaleString('uz-UZ')}`,
-      ].join('\n')
+      ].join('\n'),
+      { reply_markup: { inline_keyboard: disputeAdminButtons(String(dispute._id)) } }
     );
+  }
+});
+
+// Moderators may read the evidence; deciding stays admin-only below.
+adminHandler.action(/^dsp_evv_([a-f0-9]{24})$/, async (ctx) => {
+  if (!(await requireStaff(ctx))) return void ctx.answerCbQuery('Ruxsat yo‘q');
+  await ctx.answerCbQuery();
+  const count = await sendEvidenceTo(ctx, ctx.match[1]);
+  if (count === 0) await ctx.reply('Bu nizoga hali dalil yuborilmagan.');
+});
+
+// Moving money is admin-only (requireAdmin), like payouts; moderators can only read the list.
+adminHandler.action(/^dsp_res_(buyer|split|seller)_([a-f0-9]{24})$/, async (ctx) => {
+  const admin = await requireAdmin(ctx);
+  if (!admin) return void ctx.answerCbQuery('Ruxsat yo‘q');
+  const outcome = ctx.match[1] as DisputeOutcome;
+  try {
+    const result = await resolveDispute(ctx.match[2], outcome, String(admin._id));
+    await ctx.answerCbQuery(result.message, { show_alert: !result.ok });
+    if (result.ok) {
+      await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+      await ctx.reply(`⚖️ ${result.message} · <code>${ctx.match[2]}</code>`, { parse_mode: 'HTML' });
+    }
+  } catch (error: any) {
+    console.error('[Dispute] Resolve failed:', ctx.match[2], error?.message);
+    await ctx.answerCbQuery('Xatolik — qayta urinib ko‘ring', { show_alert: true });
   }
 });
 

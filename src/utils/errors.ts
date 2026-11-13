@@ -1,5 +1,6 @@
-import { AlreadyProcessedError, ForbiddenError, PaymentProviderError, ProductUnavailableError } from '../services/paymentService';
+import { AlreadyProcessedError, ForbiddenError, OpenPaymentLimitError, PaymentProviderError, ProductUnavailableError } from '../services/paymentService';
 import { ImageUploadError } from '../services/cloudinaryService';
+import { DisputeNotAllowedError } from '../services/disputeService';
 
 /**
  * Maps the handful of error types the payment/escrow/upload flows actually throw to specific
@@ -17,13 +18,20 @@ export function describeError(error: unknown): string {
     return 'ℹ️ Bu buyurtma allaqachon yopilgan — qayta ishlov berish shart emas.';
   }
   if (error instanceof ForbiddenError) {
-    return `❌ ${(error as Error).message || 'Ruxsat yo‘q'}`;
+    const message = (error as Error).message;
+    return `❌ ${message && message !== 'Not allowed' ? message : 'Ruxsat yo‘q'}`;
+  }
+  if (error instanceof OpenPaymentLimitError) {
+    return `⏳ ${error.message}`;
   }
   if (error instanceof PaymentProviderError) {
     return `⚠️ ${error.message}`;
   }
   if (error instanceof ImageUploadError) {
     return `⚠️ ${error.message}`;
+  }
+  if (error instanceof DisputeNotAllowedError) {
+    return `ℹ️ ${error.message}`;
   }
   console.error('[Bot] Unhandled error:', error);
   return '⚠️ Kutilmagan xatolik yuz berdi. Birozdan keyin qayta urinib ko‘ring yoki qo‘llab-quvvatlashga yozing.';

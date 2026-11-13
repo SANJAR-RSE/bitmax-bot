@@ -12,8 +12,17 @@ import { paymentService } from './paymentService';
 /** How long after Hamyon cancelled an order a late "paid" or a buyer's claim can still settle it. */
 const LATE_WINDOW_MS = 24 * 60 * 60_000;
 
+/**
+ * How long past its own deadline an order may stay "pending" at Hamyon before we stop holding
+ * the listing for it. Without a limit, a payment Hamyon never marks cancelled keeps the product
+ * reserved forever: the generic expiry job deliberately skips Hamyon orders.
+ */
+export const HAMYON_STALE_MS = 30 * 60_000;
+
+const LATE_SETTLEABLE = ['hamyon_payment_cancelled', 'hamyon_payment_timeout'];
+
 function isLateCancelled(t: any) {
-  return t.status === 'expired' && t.cancelReason === 'hamyon_payment_cancelled' &&
+  return t.status === 'expired' && LATE_SETTLEABLE.includes(t.cancelReason) &&
     Date.now() - new Date(t.expireAt).getTime() < LATE_WINDOW_MS;
 }
 
@@ -167,6 +176,14 @@ export async function reconcileHamyonPayment(id: string) {
     }
     return;
   }
+  if (remote.status === 'pending') {
+    // A late "paid" can still settle it within the late window (isLateCancelled).
+    if (t.status === 'pending_payment' && t.expireAt.getTime() + HAMYON_STALE_MS < Date.now()) {
+      console.log('[Hamyon] Still pending long after its deadline, releasing listing:', id);
+      await expireOrder(t._id as mongoose.Types.ObjectId, 'hamyon_payment_timeout');
+    }
+    return;
+  }
   if (remote.status !== 'paid') return;
   console.log('[Hamyon] Paid:', id, t.status === 'expired' ? '(after cancel)' : '');
 
@@ -212,7 +229,7 @@ export async function checkHamyonOrder(id: string, minIntervalMs = 5_000) {
 }
 
 /** A buyer says they paid an order Hamyon cancelled: re-ask Hamyon, then hand it to an admin. */
-export async function claimHamyonPaid(id: string, buyerId: string): Promise<'settled' | 'review' | 'already' | 'invalid'> {
+export async function claimHamyonPaid(id: string, buyerId: string): Promise<'settled' | 'review' | 'already' | 'invalid' | 'pending'> {
   const t = await Transaction.findOne({ _id: id, buyerId, paymentProvider: 'hamyon' });
   console.log('[Hamyon] Buyer claim:', id, t ? `${t.status}/${t.cancelReason || '-'}/${t.paymentReview || '-'}` : 'not found');
   if (!t) return 'invalid';
@@ -223,6 +240,9 @@ export async function claimHamyonPaid(id: string, buyerId: string): Promise<'set
   await reconcileHamyonPayment(id).catch(() => console.error('[Hamyon] Claim re-check failed:', id));
   const after = await Transaction.findById(id);
   if (after?.status === 'paid' || after?.status === 'completed') return 'settled';
+  // Still inside its payment window: Hamyon may simply not have seen the transfer yet. Flagging
+  // it for review here would take it out of every automatic check and pin the listing reserved.
+  if (after?.status === 'pending_payment') return 'pending';
 
   const marked = await Transaction.findOneAndUpdate(
     { _id: id, paymentReview: { $exists: false } },
@@ -245,7 +265,8 @@ export async function resolveHamyonReview(id: string, approve: boolean, adminId:
       { _id: t._id, status: { $in: ['pending_payment', 'expired'] } },
       { $set: { status: 'expired', cancelReason: 'hamyon_review_rejected', paymentReview: 'rejected' } }
     );
-    await paymentService.releaseReservation(String(t.productId));
+    // Only this buyer's hold: after a cancel the listing may already be reserved by someone else.
+    await paymentService.releaseReservation(String(t.productId), undefined, String(t.buyerId));
     await notificationService.notifyBuyer(
       buyer?.telegramId,
       `❌ <b>To‘lov topilmadi</b>\n\nAdmin <code>${t.uniqueAmount}</code> so‘m kartaga tushganini tasdiqlamadi. Savol bo‘lsa, @${escapeHtml(config.supportUsername)} ga yozing.`

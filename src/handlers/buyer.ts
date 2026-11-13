@@ -8,6 +8,7 @@ import { botApi } from '../services/botApi';
 import { notificationService } from '../services/notificationService';
 import { paymentService } from '../services/paymentService';
 import { checkHamyonOrder, claimHamyonPaid } from '../services/hamyonPayments';
+import { DISPUTE_REASONS, openDispute } from '../services/disputeService';
 import { watchHamyonPayment } from '../services/hamyonWatcher';
 import { describeRefundPolicy } from '../services/refundEngine';
 import { config } from '../config';
@@ -22,6 +23,8 @@ import {
   escrowActionButtons,
   refundReasonButtons,
   refundConfirmButtons,
+  disputeReasonButtons,
+  disputeConfirmButtons,
   dealBuyButtons,
   codeRetryButton,
   catalogPageButtons,
@@ -447,9 +450,10 @@ buyerHandler.action(/^hpay_claim_([a-f0-9]{24})$/, async (ctx) => {
       already: '✅ Bu buyurtma allaqachon to‘langan. «🛍 Xaridlarim» bo‘limidan ma’lumotlarni oching.',
       review: '⏳ So‘rovingiz adminga yuborildi. Admin kartaga pul tushganini tekshirib, tasdiqlagach shu yerga akkaunt ma’lumotlari tugmasi keladi. Qayta pul o‘tkazmang.',
       invalid: 'Bu buyurtma uchun so‘rov yuborib bo‘lmaydi (24 soatdan oshgan). Yordam uchun admin bilan bog‘laning.',
+      pending: '⏳ To‘lov hali kutilmoqda — Hamyon pulni ko‘rishi bilan avtomatik tasdiqlanadi. «🔄 Holatni tekshirish» tugmasini bosing. Qayta pul o‘tkazmang.',
     }[result];
     await ctx.reply(text);
-    if (result !== 'settled' && result !== 'already') await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    if (result !== 'settled' && result !== 'already' && result !== 'pending') await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
   } catch {
     console.error('[Hamyon] Claim failed:', ctx.match[1]);
     await ctx.reply('Hozir tekshirib bo‘lmadi. Birozdan keyin qayta bosing.');
@@ -552,10 +556,11 @@ buyerHandler.action(/^refund_escrow_(.+)$/, async (ctx) => {
   const quote = await paymentService.quoteRefundFor(escrowId);
 
   if (!quote.allowed) {
+    // The policy cannot decide this one: offer the dispute right here instead of a bare link.
     await ctx.editMessageText(
       `❌ <b>Avtomatik qaytarish mumkin emas</b>\n\n${quote.message}\n\n` +
-        `Nizo ochish uchun: ${botApi.supportLink()}`,
-      { parse_mode: 'HTML' }
+        `Muammo jiddiy bo‘lsa, nizo oching — pul admin qaror qilguncha muzlatiladi.`,
+      { parse_mode: 'HTML', reply_markup: disputeReasonButtons(escrowId).reply_markup }
     );
     await ctx.answerCbQuery();
     return;
@@ -689,6 +694,48 @@ buyerHandler.action(/^rdo_(not_working|wrong_info|recovered|other)_(.+)$/, async
   }
 });
 
+// ─── Disputes ──────────────────────────────────────────────────────────────────
+
+buyerHandler.action(/^dsp_open_([a-f0-9]{24})$/, async (ctx) => {
+  const owned = await loadOwnedEscrow(ctx.from!.id, ctx.match[1]);
+  if ('error' in owned) return void ctx.answerCbQuery(owned.error);
+  if (owned.escrow.status !== 'holding') return void ctx.answerCbQuery('Bu buyurtma yopilgan yoki nizoda');
+  if (!owned.escrow.credentialsRevealedAt) {
+    return void ctx.answerCbQuery('Ma’lumotlar hali ochilmagan — “Qaytarish” orqali pul 100% qaytadi', { show_alert: true });
+  }
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `⚖️ <b>Nizo ochish</b>\n\nPul admin qaror qilguncha muzlatiladi va sotuvchiga avtomatik o‘tmaydi.\n\n<i>Sababni tanlang:</i>`,
+    { parse_mode: 'HTML', reply_markup: disputeReasonButtons(ctx.match[1]).reply_markup }
+  );
+});
+
+buyerHandler.action(/^dsp_cat_(not_working|wrong_info|recovered|other)_([a-f0-9]{24})$/, async (ctx) => {
+  const [, reasonType, escrowId] = ctx.match;
+  await ctx.editMessageText(
+    `⚖️ <b>Nizoni tasdiqlash</b>\n\nSabab: <b>${DISPUTE_REASONS[reasonType].label}</b>\n\n` +
+      `Ochilgach, dalillaringizni (skrinshot, video) @${escapeHtml(config.supportUsername)} ga yuborasiz.`,
+    { parse_mode: 'HTML', reply_markup: disputeConfirmButtons(escrowId, reasonType).reply_markup }
+  );
+  await ctx.answerCbQuery();
+});
+
+buyerHandler.action(/^dsp_do_(not_working|wrong_info|recovered|other)_([a-f0-9]{24})$/, async (ctx) => {
+  const [, reasonType, escrowId] = ctx.match;
+  try {
+    const owned = await loadOwnedEscrow(ctx.from!.id, escrowId);
+    if ('error' in owned) return void ctx.answerCbQuery(owned.error);
+    await openDispute(escrowId, String(owned.user._id), reasonType);
+    await ctx.editMessageText(
+      `⚖️ <b>Nizo ochildi</b>\n\nPul muzlatildi. Admin ikkala tomonni eshitib qaror qiladi — natija shu yerga keladi.`,
+      { parse_mode: 'HTML' }
+    );
+    await ctx.answerCbQuery('Nizo ochildi');
+  } catch (error) {
+    await ctx.answerCbQuery(describeError(error), { show_alert: true });
+  }
+});
+
 buyerHandler.action(/^refund_cancel_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('Bekor qilindi');
   await ctx.reply('Qaytarish jarayoni bekor qilindi.', mainMenuKeyboard);
@@ -702,6 +749,7 @@ buyerHandler.action(/^help_escrow_(.+)$/, async (ctx) => {
       '',
       `<b>✅ Tasdiqlayman</b> — akkaunt joyida, pul sotuvchiga o‘tadi.`,
       `<b>🔄 Qaytarish</b> — muammo bo‘lsa, siyosat bo‘yicha pul qaytariladi.`,
+      `<b>⚖️ Nizo ochish</b> — qaytarish muddati o‘tgan yoki jiddiy muammo bo‘lsa: pul muzlatiladi va admin qaror qiladi.`,
       '',
       `<b>Qaytarish shartlari</b> (ma’lumotlarni ochgan vaqtdan hisoblanadi):`,
       describeRefundPolicy(),
